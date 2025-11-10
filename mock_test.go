@@ -1,9 +1,13 @@
 package quartz_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"runtime/pprof"
+	"strings"
 	"testing"
 	"time"
 
@@ -403,7 +407,10 @@ func Test_UnreleasedCalls(t *testing.T) {
 			_ = mClock.Now()
 		}()
 
-		trap.MustWait(testCtx) // missing release
+		c := trap.MustWait(testCtx) // missing release
+		trap.Close()                // detect unreleased call and fail
+
+		c.Release(testCtx) // clean up goroutine
 	})
 }
 
@@ -572,4 +579,56 @@ func TestTickerStop_Go123(t *testing.T) {
 	default:
 		// OK!
 	}
+}
+
+func TestMain(m *testing.M) {
+	verifyNoLeakTestMain(m)
+}
+
+func verifyNoLeakTestMain(m *testing.M) {
+	before := snapshot()
+	code := m.Run()
+	now := time.Now()
+	for {
+		after := snapshot()
+		if len(after) > len(before) {
+			// Allow test cleanup to settle.
+			if time.Since(now) < 200*time.Millisecond {
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
+			fmt.Fprintln(os.Stderr, "Possible goroutine leak(s):")
+			fmt.Fprintln(os.Stderr, diff(before, after))
+			os.Exit(1)
+		}
+		os.Exit(code)
+	}
+}
+
+func snapshot() []string {
+	var buf bytes.Buffer
+	_ = pprof.Lookup("goroutine").WriteTo(&buf, 2)
+	var clean []string
+	for _, s := range strings.Split(buf.String(), "\n\n") {
+		if !strings.Contains(s, "runtime/pprof") {
+			clean = append(clean, s)
+		}
+	}
+	return clean
+}
+
+func diff(a, b []string) string {
+	m := make(map[string]int)
+	for _, s := range a {
+		m[s]++
+	}
+	var leaks []string
+	for _, s := range b {
+		if m[s] > 0 {
+			m[s]--
+			continue
+		}
+		leaks = append(leaks, s)
+	}
+	return strings.Join(leaks, "\n\n")
 }
